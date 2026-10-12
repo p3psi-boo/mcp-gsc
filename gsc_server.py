@@ -864,7 +864,7 @@ def _check_indexing_single_url(site_url: str, page_url: str) -> Dict[str, Option
             )
 
         robots_state = index_status.get("robotsTxtState", "")
-        if robots_state == "BLOCKED":
+        if robots_state == "DISALLOWED":
             result["robots_blocked"] = page_url
 
         fetch_state = index_status.get("pageFetchState", "")

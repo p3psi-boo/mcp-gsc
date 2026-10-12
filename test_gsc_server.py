@@ -593,7 +593,7 @@ class TestCheckIndexingIssues(unittest.IsolatedAsyncioTestCase):
             if page.endswith("/blocked/"):
                 call.execute.return_value = {"inspectionResult": {"indexStatusResult": {
                     "verdict": "FAIL", "coverageState": "Blocked by robots.txt",
-                    "robotsTxtState": "BLOCKED"}}}
+                    "robotsTxtState": "DISALLOWED"}}}
             else:
                 call.execute.return_value = {"inspectionResult": {"indexStatusResult": {
                     "verdict": "PASS", "coverageState": "Submitted and indexed"}}}
