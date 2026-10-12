@@ -5,7 +5,7 @@ Context for AI coding assistants (Claude, Cursor, Copilot, etc.) working in this
 ## What this is
 
 MCP server that connects Google Search Console to AI assistants.
-Single file: `gsc_server.py` (~1,670 lines). Built with FastMCP — no custom framework.
+Single file: `gsc_server.py` (~2,300 lines). Built with FastMCP — no custom framework.
 
 ## Running locally
 
@@ -35,6 +35,9 @@ Set `GSC_SKIP_OAUTH=true` to force service account mode and skip OAuth entirely.
 | `GSC_CREDENTIALS_PATH` | — | Path to service account JSON key file |
 | `GSC_OAUTH_CLIENT_SECRETS_FILE` | `client_secrets.json` | Path to OAuth client secrets file |
 | `GSC_SKIP_OAUTH` | `false` | Set `true` to skip OAuth and use service account only |
+| `GSC_MAX_RESPONSE_CHARS` | `80000` | Size cap for row-based tool responses (trimmed with a `truncation` hint); `0` disables |
+| `GSC_EXPORT_DIR` | `<config dir>/exports` | Where `export_search_analytics` writes files |
+| `GSC_PAGESPEED_API_KEY` | — | Optional API key for `get_core_web_vitals` (PageSpeed Insights) |
 
 ## Adding a new tool
 
@@ -42,6 +45,7 @@ Set `GSC_SKIP_OAUTH=true` to force service account mode and skip OAuth entirely.
 2. Use `get_gsc_service()` for auth — it handles OAuth and service account automatically
 3. Return `json.dumps(result)` not formatted text strings (LLMs work better with structured data)
 4. Handle `HttpError` and return a plain string error message on failure
+5. For row-based Search Analytics tools, build the body with `_build_search_analytics_request()` and serialize rows with `_dumps_rows_within_budget()` so `response_format` and `GSC_MAX_RESPONSE_CHARS` apply
 
 ```python
 @mcp.tool()

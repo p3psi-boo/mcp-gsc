@@ -9,6 +9,15 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ## What's New
 
+### [Unreleased]
+- **Full Search Analytics API coverage** — `get_advanced_search_analytics` now supports the `hour` dimension (hourly data for the last ~10 days), the `searchAppearance` dimension and filter, `includingRegex` / `excludingRegex` filters, `aggregation_type`, and the `googleNews` search type. The simpler analytics tools gained a `search_type` argument.
+- **Data freshness flags** — analytics responses include `data_freshness` (`first_incomplete_date` / `first_incomplete_hour`) so a still-processing day isn't mistaken for a traffic drop.
+- **URL Inspection additions** — `language_code` for localized messages, AMP status and issues, and the sitemaps through which Google discovered the URL.
+- **New `export_search_analytics` tool** — pages through the API (25,000 rows per call) and writes up to 100k+ rows to a CSV/JSONL file, returning only a summary and preview.
+- **New `get_core_web_vitals` tool** — LCP / INP / CLS real-user (CrUX) and lab data via the PageSpeed Insights API, since the Search Console API doesn't expose the Core Web Vitals report.
+- **Context-friendly output** — row-based tools accept `response_format="compact"` or `"csv"` (30–50% smaller than the default JSON), and responses larger than `GSC_MAX_RESPONSE_CHARS` are trimmed with a `truncation` hint.
+- **Fixed `check_indexing_issues` robots.txt detection** — it compared against `BLOCKED`, but the API reports `DISALLOWED`, so robots.txt blocks were never flagged.
+
 ### [0.4.1] — September 2026
 - **`check_indexing_issues` runs concurrently** — same fix as #31, so it no longer times out on 10-URL batches against `sc-domain:*` properties. Thanks [@kuldiph](https://github.com/kuldiph). (#55)
 - **Removed a leftover dead `orderBy`** in `get_search_by_page_query` (the Search Analytics API ignores it). Thanks [@kuldiph](https://github.com/kuldiph). (#55)
@@ -67,8 +76,10 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 | `get_performance_overview` | Summary of site performance | Site URL, time period |
 | `compare_search_periods` | Compare performance between two time periods | Site URL, two date ranges |
 | `get_search_by_page_query` | Search terms driving traffic to a specific page | Site URL, page URL |
-| `get_advanced_search_analytics` | Analytics with filters by country, device, query, page | Site URL |
-| `inspect_url_enhanced` | Detailed crawl/index status for a URL | Site URL, page URL |
+| `get_advanced_search_analytics` | Filters (incl. regex), pagination, hourly data, search appearance, Discover / Google News | Site URL |
+| `export_search_analytics` | Export large result sets to a CSV/JSONL file, return only a summary | Site URL |
+| `get_core_web_vitals` | Core Web Vitals (LCP, INP, CLS) field and lab data via PageSpeed Insights | Page URL |
+| `inspect_url_enhanced` | Detailed crawl/index, rich result and AMP status for a URL | Site URL, page URL |
 | `batch_url_inspection` | Inspect up to 10 URLs at once | Site URL, list of URLs |
 | `check_indexing_issues` | Check multiple URLs for indexing problems | Site URL, list of URLs |
 | `get_sitemaps` | Lists all sitemaps for a site | Site URL |
@@ -76,7 +87,7 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 | `manage_sitemaps` | Submit or delete sitemaps | Site URL, action |
 | `reauthenticate` | Re-run the OAuth browser login (switch accounts) | Nothing |
 
-*Ask your AI assistant to "call get_capabilities" for the full list of all 20 tools.*
+*Ask your AI assistant to "call get_capabilities" for the full list of all 22 tools.*
 
 ---
 
@@ -331,6 +342,19 @@ If you see your properties — it's working. If not, ask: **"Call get_capabiliti
 | `GSC_SKIP_OAUTH` | No | `false` | Set to `"true"` to force service account auth and skip OAuth entirely |
 | `GSC_DATA_STATE` | No | `"all"` | `"all"` matches the GSC dashboard. `"final"` returns only confirmed data (2–3 day lag). |
 | `GSC_ALLOW_DESTRUCTIVE` | No | `false` | Set to `"true"` to enable add/delete site and delete sitemap tools |
+| `GSC_MAX_RESPONSE_CHARS` | No | `80000` | Upper bound on the size of row-based tool responses; larger results are trimmed with a `truncation` hint. `0` disables the limit. |
+| `GSC_EXPORT_DIR` | No | `<config dir>/exports` | Directory where `export_search_analytics` writes CSV/JSONL files |
+| `GSC_PAGESPEED_API_KEY` | No | — | Google Cloud API key with the PageSpeed Insights API enabled. `get_core_web_vitals` works without it, but the keyless quota is small. |
+
+### Keeping large results out of the context window
+
+Search Console can return up to 25,000 rows per call, which can easily fill an AI assistant's context. In order of preference:
+
+1. **Aggregate before you fetch.** Use `get_performance_overview` for totals, add `filters` (including `includingRegex`), and group by fewer dimensions.
+2. **Use a compact format.** Pass `response_format="compact"` (column header + value arrays) or `"csv"` — 30–50% smaller than the default JSON, more when values are short.
+3. **Paginate.** `get_advanced_search_analytics` returns `pagination.next_start_row`; fetch the next page only if you need it.
+4. **Export instead of reading.** `export_search_analytics` writes the full result set to a file and returns only totals and a short preview. Point a code tool or spreadsheet at the file for further analysis.
+5. **Safety net.** Any row-based response over `GSC_MAX_RESPONSE_CHARS` is trimmed and tells the assistant how to get the rest.
 
 ---
 

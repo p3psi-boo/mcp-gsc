@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-12
+
+- Search Analytics: `hour` dimension (`hourly_all`), `searchAppearance` dimension/filter, regex filter operators, `aggregation_type`, `googleNews` search type, and `data_freshness` metadata; `search_type` on `get_search_analytics`, `get_performance_overview`, `compare_search_periods` and `get_search_by_page_query`
+- URL Inspection: `language_code`, AMP result, and discovering sitemaps
+- New `export_search_analytics` tool (auto-paginated CSV/JSONL export)
+- New `get_core_web_vitals` tool (PageSpeed Insights / CrUX)
+- `response_format` (`json` / `compact` / `csv`) and `GSC_MAX_RESPONSE_CHARS` response trimming
+- `get_performance_overview` no longer drops the last day of the daily trend
+- Fix `check_indexing_issues` robots.txt detection (`DISALLOWED`, not `BLOCKED`)
+
 ## 2026-04-13
 
 - Bump all Python dependencies to their latest minor/patch versions via `uv lock --upgrade` (thanks @Herriaan, #24)
