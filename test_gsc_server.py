@@ -593,7 +593,7 @@ class TestCheckIndexingIssues(unittest.IsolatedAsyncioTestCase):
             if page.endswith("/blocked/"):
                 call.execute.return_value = {"inspectionResult": {"indexStatusResult": {
                     "verdict": "FAIL", "coverageState": "Blocked by robots.txt",
-                    "robotsTxtState": "BLOCKED"}}}
+                    "robotsTxtState": "DISALLOWED"}}}
             else:
                 call.execute.return_value = {"inspectionResult": {"indexStatusResult": {
                     "verdict": "PASS", "coverageState": "Submitted and indexed"}}}
@@ -999,6 +999,373 @@ class TestStdoutClean(unittest.TestCase):
 
         stdout_output = captured.getvalue()
         self.assertEqual(stdout_output, "", f"Unexpected stdout: {stdout_output!r}")
+
+
+# ---------------------------------------------------------------------------
+# Search Analytics: hourly data, search appearance, regex, aggregation, metadata
+# ---------------------------------------------------------------------------
+
+def _query_body(service):
+    return service.searchanalytics().query.call_args.kwargs["body"]
+
+
+_ONE_ROW = {"rows": [{"keys": ["seo"], "clicks": 1, "impressions": 10, "ctr": 0.1, "position": 2.0}]}
+
+
+class TestSearchAnalyticsApiCoverage(unittest.IsolatedAsyncioTestCase):
+
+    async def test_hour_dimension_sets_hourly_all_and_surfaces_freshness(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = {
+            "rows": [{"keys": ["2026-10-11T10:00:00-07:00"], "clicks": 3, "impressions": 30,
+                      "ctr": 0.1, "position": 4.0}],
+            "metadata": {"firstIncompleteHour": "2026-10-11T10:00:00-07:00"},
+        }
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_advanced_search_analytics("https://example.com/", dimensions="hour")
+        body = _query_body(service)
+        self.assertEqual(body["dataState"], "hourly_all")
+        self.assertEqual(body["dimensions"], ["hour"])
+        data = json.loads(result)
+        self.assertEqual(data["data_freshness"]["first_incomplete_hour"], "2026-10-11T10:00:00-07:00")
+
+    async def test_hour_dimension_rejects_other_data_state(self):
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", return_value=_make_service()):
+            result = await mod.get_advanced_search_analytics(
+                "https://example.com/", dimensions="hour", data_state="final"
+            )
+        self.assertIn("hourly_all", result)
+
+    async def test_hourly_all_requires_hour_dimension(self):
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", return_value=_make_service()):
+            result = await mod.get_advanced_search_analytics(
+                "https://example.com/", dimensions="query", data_state="hourly_all"
+            )
+        self.assertIn("hour", result)
+
+    async def test_search_appearance_regex_filter_and_aggregation(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = {
+            **_ONE_ROW, "responseAggregationType": "byProperty",
+        }
+        filters = json.dumps([
+            {"dimension": "search_appearance", "operator": "equals", "expression": "VIDEO"},
+            {"dimension": "query", "operator": "INCLUDING_REGEX", "expression": "^(how|what) "},
+        ])
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_advanced_search_analytics(
+                "https://example.com/", dimensions="query,searchappearance",
+                filters=filters, aggregation_type="by_property", search_type="googleNews",
+            )
+        body = _query_body(service)
+        self.assertEqual(body["dimensions"], ["query", "searchAppearance"])
+        self.assertEqual(body["type"], "GOOGLE_NEWS")
+        self.assertEqual(body["aggregationType"], "byProperty")
+        group = body["dimensionFilterGroups"][0]
+        self.assertEqual(group["filters"][0]["dimension"], "searchAppearance")
+        self.assertEqual(group["filters"][1]["operator"], "includingRegex")
+        self.assertEqual(json.loads(result)["aggregation_type"], "byProperty")
+
+    async def test_invalid_operator_lists_valid_values(self):
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", return_value=_make_service()):
+            result = await mod.get_advanced_search_analytics(
+                "https://example.com/", filter_dimension="query",
+                filter_operator="startsWith", filter_expression="x",
+            )
+        self.assertIn("includingRegex", result)
+
+    async def test_invalid_search_type_rejected(self):
+        mod = _load_module()
+        with patch("gsc_server.get_gsc_service", return_value=_make_service()):
+            result = await mod.get_search_analytics("https://example.com/", search_type="shopping")
+        self.assertIn("Invalid search_type", result)
+
+    async def test_performance_overview_passes_search_type_and_covers_every_day(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.side_effect = [
+            {"rows": [{"keys": [], "clicks": 5, "impressions": 50, "ctr": 0.1, "position": 3.0}]},
+            {"rows": [], "metadata": {"firstIncompleteDate": "2026-10-11"}},
+        ]
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_performance_overview("https://example.com/", days=7, search_type="discover")
+        body = _query_body(service)
+        self.assertEqual(body["type"], "DISCOVER")
+        self.assertEqual(body["rowLimit"], 8)
+        self.assertEqual(json.loads(result)["data_freshness"]["first_incomplete_date"], "2026-10-11")
+
+
+# ---------------------------------------------------------------------------
+# Context budget: response formats and truncation
+# ---------------------------------------------------------------------------
+
+class TestResponseBudget(unittest.IsolatedAsyncioTestCase):
+
+    def _rows(self, n):
+        return {"rows": [{"keys": [f"query number {i}"], "clicks": n - i, "impressions": 100,
+                          "ctr": 0.05, "position": 3.0} for i in range(n)]}
+
+    async def test_compact_format_uses_columns_and_arrays(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._rows(3)
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_search_analytics("https://example.com/", response_format="compact")
+        data = json.loads(result)
+        self.assertEqual(data["columns"], ["query", "clicks", "impressions", "ctr", "position"])
+        self.assertEqual(data["rows"][0], ["query number 0", 3, 100, 0.05, 3.0])
+
+    async def test_csv_format(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._rows(2)
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_search_by_page_query(
+                "https://example.com/", "https://example.com/a/", response_format="csv"
+            )
+        lines = json.loads(result)["rows_csv"].strip().split("\n")
+        self.assertEqual(lines[0], "query,clicks,impressions,ctr,position")
+        self.assertEqual(len(lines), 3)
+
+    async def test_compact_is_smaller_than_json(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._rows(200)
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            as_json = await mod.get_advanced_search_analytics("https://example.com/")
+            as_compact = await mod.get_advanced_search_analytics("https://example.com/", response_format="compact")
+        self.assertLess(len(as_compact), len(as_json) * 0.7)
+
+    async def test_large_response_is_trimmed_with_hint(self):
+        mod = _load_module({"GSC_MAX_RESPONSE_CHARS": "3000"})
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._rows(500)
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_advanced_search_analytics("https://example.com/", row_limit=500)
+        self.assertLessEqual(len(result), 3000)
+        data = json.loads(result)
+        self.assertEqual(data["truncation"]["total_rows"], 500)
+        self.assertEqual(len(data["rows"]), data["truncation"]["returned_rows"])
+        self.assertGreater(data["truncation"]["returned_rows"], 0)
+        self.assertIn("export_search_analytics", data["truncation"]["hint"])
+
+    async def test_limit_can_be_disabled(self):
+        mod = _load_module({"GSC_MAX_RESPONSE_CHARS": "0"})
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._rows(500)
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.get_advanced_search_analytics("https://example.com/", row_limit=500)
+        data = json.loads(result)
+        self.assertNotIn("truncation", data)
+        self.assertEqual(len(data["rows"]), 500)
+
+    async def test_compare_periods_keeps_comparison_key(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.side_effect = [_ONE_ROW, _ONE_ROW]
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.compare_search_periods(
+                "https://example.com/", "2026-09-01", "2026-09-30", "2026-08-01", "2026-08-31",
+            )
+        self.assertIn("comparison", json.loads(result))
+
+
+# ---------------------------------------------------------------------------
+# export_search_analytics
+# ---------------------------------------------------------------------------
+
+class TestExportSearchAnalytics(unittest.IsolatedAsyncioTestCase):
+
+    def _page(self, start, n):
+        return {"rows": [{"keys": [f"q{i}", f"https://example.com/{i}"], "clicks": 10, "impressions": 100,
+                          "ctr": 0.1, "position": 2.0} for i in range(start, start + n)]}
+
+    async def test_pages_through_api_and_writes_csv(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.side_effect = [
+            self._page(0, 2), self._page(2, 2), self._page(4, 1),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(mod, "EXPORT_DIR", tmp), patch.object(mod, "_API_MAX_ROWS", 2), \
+             patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.export_search_analytics("https://example.com/", preview_rows=2)
+            data = json.loads(result)
+            with open(data["file_path"], encoding="utf-8") as fh:
+                lines = fh.read().strip().split("\n")
+
+        self.assertEqual(data["row_count"], 5)
+        self.assertEqual(data["api_calls"], 3)
+        self.assertTrue(data["complete"])
+        self.assertEqual(len(data["preview"]), 2)
+        self.assertEqual(data["totals_of_exported_rows"]["clicks"], 50)
+        self.assertEqual(lines[0], "query,page,clicks,impressions,ctr,position")
+        self.assertEqual(len(lines), 6)
+        start_rows = [c.kwargs["body"]["startRow"] for c in service.searchanalytics().query.call_args_list
+                      if c.kwargs.get("body")]
+        self.assertEqual(start_rows, [0, 2, 4])
+
+    async def test_stops_at_max_rows_and_writes_jsonl(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = self._page(0, 3)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mod, "EXPORT_DIR", tmp), \
+             patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.export_search_analytics(
+                "https://example.com/", max_rows=3, file_format="jsonl"
+            )
+            data = json.loads(result)
+            with open(data["file_path"], encoding="utf-8") as fh:
+                records = [json.loads(line) for line in fh]
+        self.assertFalse(data["complete"])
+        self.assertIn("max_rows", data["note"])
+        self.assertEqual(records[0]["query"], "q0")
+
+    async def test_no_data_leaves_no_file(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = {}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mod, "EXPORT_DIR", tmp), \
+             patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.export_search_analytics("https://example.com/")
+            self.assertEqual(os.listdir(tmp), [])
+        self.assertIn("No search analytics data", result)
+
+
+# ---------------------------------------------------------------------------
+# URL inspection: languageCode, AMP, sitemaps
+# ---------------------------------------------------------------------------
+
+class TestUrlInspectionCoverage(unittest.IsolatedAsyncioTestCase):
+
+    _RESPONSE = {
+        "inspectionResult": {
+            "indexStatusResult": {
+                "verdict": "PASS",
+                "sitemap": ["https://example.com/sitemap.xml"],
+            },
+            "ampResult": {
+                "verdict": "FAIL",
+                "ampUrl": "https://example.com/page/amp/",
+                "issues": [{"severity": "ERROR", "issueMessage": "Referenced AMP URL is not an AMP"}],
+            },
+        }
+    }
+
+    async def test_inspect_passes_language_and_reports_amp_and_sitemaps(self):
+        mod = _load_module()
+        service = _make_service()
+        service.urlInspection().index().inspect().execute.return_value = self._RESPONSE
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.inspect_url_enhanced(
+                "https://example.com/", "https://example.com/page/", language_code="zh-CN"
+            )
+        body = service.urlInspection().index().inspect.call_args.kwargs["body"]
+        self.assertEqual(body["languageCode"], "zh-CN")
+        data = json.loads(result)
+        self.assertEqual(data["sitemaps"], ["https://example.com/sitemap.xml"])
+        self.assertEqual(data["amp"]["verdict"], "FAIL")
+        self.assertEqual(data["amp"]["issues"][0]["severity"], "ERROR")
+
+    async def test_inspect_omits_amp_when_absent(self):
+        mod = _load_module()
+        service = _make_service()
+        service.urlInspection().index().inspect().execute.return_value = {
+            "inspectionResult": {"indexStatusResult": {"verdict": "PASS"}}
+        }
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.inspect_url_enhanced("https://example.com/", "https://example.com/page/")
+        body = service.urlInspection().index().inspect.call_args.kwargs["body"]
+        self.assertNotIn("languageCode", body)
+        self.assertNotIn("amp", json.loads(result))
+
+    async def test_batch_passes_language_and_reports_amp(self):
+        mod = _load_module()
+        service = _make_service()
+        service.urlInspection().index().inspect().execute.return_value = self._RESPONSE
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            result = await mod.batch_url_inspection(
+                "https://example.com/", "https://example.com/page/", language_code="ja"
+            )
+        body = service.urlInspection().index().inspect.call_args.kwargs["body"]
+        self.assertEqual(body["languageCode"], "ja")
+        self.assertEqual(json.loads(result)["results"][0]["amp"]["verdict"], "FAIL")
+
+
+# ---------------------------------------------------------------------------
+# get_core_web_vitals
+# ---------------------------------------------------------------------------
+
+class TestCoreWebVitals(unittest.IsolatedAsyncioTestCase):
+
+    _PSI = {
+        "loadingExperience": {
+            "overall_category": "AVERAGE",
+            "metrics": {
+                "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2900, "category": "AVERAGE"},
+                "INTERACTION_TO_NEXT_PAINT": {"percentile": 180, "category": "FAST"},
+                "CUMULATIVE_LAYOUT_SHIFT_SCORE": {"percentile": 12, "category": "AVERAGE"},
+            },
+        },
+        "lighthouseResult": {
+            "categories": {"performance": {"score": 0.62}},
+            "audits": {
+                "largest-contentful-paint": {"numericValue": 4123.4},
+                "cumulative-layout-shift": {"numericValue": 0.1234},
+                "render-blocking-resources": {"score": 0.3, "title": "Eliminate render-blocking resources",
+                                              "details": {"type": "opportunity", "overallSavingsMs": 900}},
+                "unused-javascript": {"score": 0.5, "title": "Reduce unused JavaScript",
+                                      "metricSavings": {"LCP": 1500, "FCP": 300}},
+                "uses-http2": {"score": 1, "title": "Use HTTP/2",
+                               "details": {"type": "opportunity", "overallSavingsMs": 0}},
+            },
+        },
+    }
+
+    async def test_shapes_field_and_lab_data(self):
+        mod = _load_module()
+        with patch("gsc_server._fetch_pagespeed", return_value=self._PSI) as fetch:
+            result = await mod.get_core_web_vitals("https://example.com/", strategy="desktop")
+        fetch.assert_called_once_with("https://example.com/", "DESKTOP")
+        data = json.loads(result)
+        field = data["field_data_page"]["metrics"]
+        self.assertEqual(field["lcp_ms"], {"p75": 2900, "category": "AVERAGE"})
+        self.assertEqual(field["cls"]["p75"], 0.12)
+        self.assertIsNone(data["field_data_origin"])
+        self.assertEqual(data["lab_data"]["performance_score"], 62)
+        self.assertEqual(data["lab_data"]["metrics"]["cls"], 0.123)
+        self.assertEqual(
+            [o["id"] for o in data["lab_data"]["top_opportunities"]],
+            ["unused-javascript", "render-blocking-resources"],
+        )
+
+    async def test_no_field_data_adds_note(self):
+        mod = _load_module()
+        with patch("gsc_server._fetch_pagespeed", return_value={"lighthouseResult": {}}):
+            result = await mod.get_core_web_vitals("https://example.com/")
+        self.assertIn("field_data_note", json.loads(result))
+
+    async def test_quota_error_mentions_api_key(self):
+        import urllib.error
+        mod = _load_module()
+        err = urllib.error.HTTPError(
+            "https://x", 429, "Too Many Requests", {},
+            io.BytesIO(b'{"error": {"message": "Quota exceeded"}}'),
+        )
+        with patch("gsc_server._fetch_pagespeed", side_effect=err):
+            result = await mod.get_core_web_vitals("https://example.com/")
+        self.assertIn("GSC_PAGESPEED_API_KEY", result)
+        self.assertIn("Quota exceeded", result)
+
+    async def test_invalid_strategy(self):
+        mod = _load_module()
+        result = await mod.get_core_web_vitals("https://example.com/", strategy="tablet")
+        self.assertIn("Invalid strategy", result)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,16 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import asyncio
+import csv
+import io
 import logging
 import os
 import json
+import re
 import sys
 import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 # Fail loudly on unsupported Python. The mcp/FastMCP dependency requires 3.11+.
@@ -102,6 +108,21 @@ if _raw_data_state not in ("all", "final"):
         "Accepted values are 'all' (default, matches GSC dashboard) or 'final' (2-3 day lag)."
     )
 DATA_STATE = _raw_data_state
+
+# Upper bound (in characters) on the JSON returned by row-based tools. Large result
+# sets are trimmed to fit and flagged with a "truncation" block, so a single call
+# can't flood the model's context window. Set to 0 to disable.
+try:
+    MAX_RESPONSE_CHARS = int(os.environ.get("GSC_MAX_RESPONSE_CHARS", "80000"))
+except ValueError:
+    raise ValueError("GSC_MAX_RESPONSE_CHARS must be an integer (0 disables the limit)")
+
+# Where export_search_analytics writes full result sets.
+EXPORT_DIR = _expand_path(os.environ.get("GSC_EXPORT_DIR")) or os.path.join(_CONFIG_DIR, "exports")
+
+# Optional API key for the PageSpeed Insights API (get_core_web_vitals). The API
+# works without a key but with a very small shared quota.
+PAGESPEED_API_KEY = os.environ.get("GSC_PAGESPEED_API_KEY")
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
@@ -249,6 +270,203 @@ def _site_not_found_error(site_url: str) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Search Analytics helpers
+# ---------------------------------------------------------------------------
+
+_SEARCH_TYPES = ("WEB", "IMAGE", "VIDEO", "NEWS", "DISCOVER", "GOOGLE_NEWS")
+_DIMENSIONS = ("query", "page", "country", "device", "date", "searchAppearance", "hour")
+_FILTER_DIMENSIONS = ("query", "page", "country", "device", "searchAppearance")
+_FILTER_OPERATORS = ("equals", "notEquals", "contains", "notContains", "includingRegex", "excludingRegex")
+_AGGREGATION_TYPES = ("auto", "byPage", "byProperty", "byNewsShowcasePanel")
+_DATA_STATES = ("all", "final", "hourly_all")
+_RESPONSE_FORMATS = ("json", "compact", "csv")
+_API_MAX_ROWS = 25000
+
+
+def _normalize_choice(value: str, choices: Tuple[str, ...], label: str) -> str:
+    """Match ``value`` against ``choices`` ignoring case, underscores and dashes."""
+    key = re.sub(r"[_\-\s]", "", str(value)).lower()
+    for choice in choices:
+        if re.sub(r"[_\-\s]", "", choice).lower() == key:
+            return choice
+    raise ValueError(f"Invalid {label} '{value}'. Valid values: {', '.join(choices)}")
+
+
+def _parse_dimensions(dimensions: Optional[str]) -> List[str]:
+    if not dimensions:
+        return []
+    return [_normalize_choice(d.strip(), _DIMENSIONS, "dimension") for d in dimensions.split(",") if d.strip()]
+
+
+def _parse_filters(
+    filters: Optional[str] = None,
+    filter_dimension: Optional[str] = None,
+    filter_operator: str = "contains",
+    filter_expression: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Parse the JSON ``filters`` array (or the single-filter args) into API filter objects."""
+    if filters:
+        try:
+            filter_list = json.loads(filters)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid filters JSON. Please provide a valid JSON array of filter objects.")
+        if not isinstance(filter_list, list) or len(filter_list) == 0:
+            raise ValueError("Invalid filters value. Expected a non-empty JSON array of filter objects.")
+    elif filter_dimension and filter_expression:
+        filter_list = [{"dimension": filter_dimension, "operator": filter_operator, "expression": filter_expression}]
+    else:
+        return []
+
+    parsed = []
+    for f in filter_list:
+        if not isinstance(f, dict) or not all(k in f for k in ("dimension", "operator", "expression")):
+            raise ValueError(
+                "Each filter object must have 'dimension', 'operator', and 'expression' keys. "
+                f"Invalid filter: {f}"
+            )
+        parsed.append({
+            "dimension": _normalize_choice(f["dimension"], _FILTER_DIMENSIONS, "filter dimension"),
+            "operator": _normalize_choice(f["operator"], _FILTER_OPERATORS, "filter operator"),
+            "expression": str(f["expression"]),
+        })
+    return parsed
+
+
+def _build_search_analytics_request(
+    start_date: str,
+    end_date: str,
+    dimension_list: List[str],
+    search_type: str = "web",
+    data_state: Optional[str] = None,
+    aggregation_type: Optional[str] = None,
+    filter_list: Optional[List[Dict[str, str]]] = None,
+    row_limit: Optional[int] = None,
+    start_row: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build and validate a searchanalytics.query body. Raises ValueError with a user-facing message."""
+    if data_state:
+        resolved_data_state = _normalize_choice(data_state, _DATA_STATES, "data_state")
+    elif "hour" in dimension_list:
+        resolved_data_state = "hourly_all"
+    else:
+        resolved_data_state = DATA_STATE
+
+    if "hour" in dimension_list and resolved_data_state != "hourly_all":
+        raise ValueError("The 'hour' dimension requires data_state='hourly_all' (leave data_state empty to set it automatically).")
+    if resolved_data_state == "hourly_all" and "hour" not in dimension_list:
+        raise ValueError("data_state='hourly_all' is only valid when grouping by the 'hour' dimension.")
+
+    request: Dict[str, Any] = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "dimensions": dimension_list,
+        "type": _normalize_choice(search_type or "web", _SEARCH_TYPES, "search_type"),
+        "dataState": resolved_data_state,
+    }
+    if aggregation_type:
+        request["aggregationType"] = _normalize_choice(aggregation_type, _AGGREGATION_TYPES, "aggregation_type")
+    if filter_list:
+        request["dimensionFilterGroups"] = [{"groupType": "and", "filters": filter_list}]
+    if row_limit is not None:
+        request["rowLimit"] = max(1, min(row_limit, _API_MAX_ROWS))
+    if start_row:
+        request["startRow"] = start_row
+    return request
+
+
+def _shape_rows(api_rows: List[Dict[str, Any]], dimension_list: List[str]) -> List[Dict[str, Any]]:
+    rows = []
+    for row in api_rows:
+        keys = row.get("keys", [])
+        entry = {dim: keys[i] if i < len(keys) else None for i, dim in enumerate(dimension_list)}
+        entry["clicks"] = row.get("clicks", 0)
+        entry["impressions"] = row.get("impressions", 0)
+        entry["ctr"] = round(row.get("ctr", 0), 4)
+        entry["position"] = round(row.get("position", 0), 1)
+        rows.append(entry)
+    return rows
+
+
+def _data_freshness(response: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Surface the API's incomplete-data markers so the model doesn't read a partial day as a drop."""
+    metadata = response.get("metadata") or {}
+    freshness = {}
+    if metadata.get("firstIncompleteDate"):
+        freshness["first_incomplete_date"] = metadata["firstIncompleteDate"]
+    if metadata.get("firstIncompleteHour"):
+        freshness["first_incomplete_hour"] = metadata["firstIncompleteHour"]
+    if not freshness:
+        return None
+    freshness["note"] = "Data on/after this point is still being processed and may change (America/Los_Angeles time)."
+    return freshness
+
+
+def _summarize_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    clicks = sum(r.get("clicks", 0) for r in rows)
+    impressions = sum(r.get("impressions", 0) for r in rows)
+    weighted_position = sum(r.get("position", 0) * r.get("impressions", 0) for r in rows)
+    return {
+        "clicks": clicks,
+        "impressions": impressions,
+        "ctr": round(clicks / impressions, 4) if impressions else 0,
+        "position": round(weighted_position / impressions, 1) if impressions else 0,
+    }
+
+
+def _csv_cell(value: Any) -> Any:
+    return " | ".join(str(v) for v in value) if isinstance(value, (list, tuple)) else value
+
+
+def _rows_payload(rows: List[Dict[str, Any]], response_format: str) -> Dict[str, Any]:
+    """Render rows as a list of objects (json), a column header plus value arrays (compact), or CSV text."""
+    if response_format == "json" or not rows:
+        return {"rows": rows}
+    columns = list(rows[0].keys())
+    if response_format == "compact":
+        return {"columns": columns, "rows": [[r.get(c) for c in columns] for r in rows]}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(columns)
+    for r in rows:
+        writer.writerow([_csv_cell(r.get(c)) for c in columns])
+    return {"rows_csv": buf.getvalue()}
+
+
+def _dumps_rows_within_budget(base: Dict[str, Any], rows: List[Dict[str, Any]], response_format: str = "json") -> str:
+    """Serialize ``base`` plus ``rows``, dropping trailing rows so the output fits MAX_RESPONSE_CHARS."""
+    response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
+
+    def _render(n: int, truncated: bool) -> str:
+        payload = dict(base)
+        if truncated:
+            payload["truncation"] = {
+                "returned_rows": n,
+                "total_rows": len(rows),
+                "omitted_rows": len(rows) - n,
+                "hint": (
+                    "Response trimmed to fit the context budget (GSC_MAX_RESPONSE_CHARS). "
+                    "Use response_format='compact' or 'csv', a smaller row_limit, filters, "
+                    "or export_search_analytics to write the full result set to a file."
+                ),
+            }
+        payload.update(_rows_payload(rows[:n], response_format))
+        return json.dumps(payload, ensure_ascii=False)
+
+    full = _render(len(rows), False)
+    if MAX_RESPONSE_CHARS <= 0 or len(full) <= MAX_RESPONSE_CHARS:
+        return full
+
+    lo, hi = 0, len(rows) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(_render(mid, True)) <= MAX_RESPONSE_CHARS:
+            lo = mid
+        else:
+            hi = mid - 1
+    return _render(lo, True)
+
+
 @mcp.tool()
 async def get_capabilities() -> str:
     """
@@ -288,12 +506,22 @@ Analytics & Reporting:
   - get_performance_overview: Summary of site performance for a time period
   - compare_search_periods: Compare performance between two time periods
   - get_search_by_page_query: Search terms driving traffic to a specific page
-  - get_advanced_search_analytics: Advanced filtering by country, device, query, page
+  - get_advanced_search_analytics: Filtering (incl. regex), pagination, hourly data, search
+    appearance breakdowns, aggregation type, Discover / Google News
+  - export_search_analytics: Write large result sets (100k+ rows) to a CSV/JSONL file and
+    return only a summary — use this instead of pulling huge tables into the chat
 
 URL Inspection & Indexing:
-  - inspect_url_enhanced: Detailed crawl/index status for a specific URL
+  - inspect_url_enhanced: Detailed crawl/index, rich result and AMP status for a specific URL
   - batch_url_inspection: Inspect up to 10 URLs at once
   - check_indexing_issues: Check multiple URLs for indexing problems
+
+Page Experience:
+  - get_core_web_vitals: Core Web Vitals (LCP, INP, CLS) field + lab data via PageSpeed Insights
+
+Keeping responses small:
+  - Row-based tools accept response_format="compact" or "csv" (30-50% smaller than "json")
+  - Responses over GSC_MAX_RESPONSE_CHARS are trimmed and include a "truncation" hint
 
 Sitemaps:
   - get_sitemaps: List all sitemaps for a site
@@ -461,7 +689,14 @@ async def delete_site(site_url: str) -> str:
         return f"Error removing site: {str(e)}"
 
 @mcp.tool()
-async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
+async def get_search_analytics(
+    site_url: str,
+    days: int = 28,
+    dimensions: str = "query",
+    row_limit: int = 20,
+    search_type: str = "web",
+    response_format: str = "json",
+) -> str:
     """
     Get search analytics data for a specific property.
     
@@ -470,59 +705,54 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
         days: Number of days to look back (default: 28)
-        dimensions: Dimensions to group by (default: query). Options: query, page, device, country, date
-                   You can provide multiple dimensions separated by comma (e.g., "query,page")
+        dimensions: Dimensions to group by (default: query). Options: query, page, device, country,
+                   date, searchAppearance. You can provide multiple dimensions separated by comma
+                   (e.g., "query,page"). For hourly data use get_advanced_search_analytics with "hour".
         row_limit: Number of rows to return (default: 20, max: 500). Use 5-20 for quick overviews,
                    50-200 for deeper analysis, up to 500 for comprehensive reports. For bulk exports
                    beyond 500 rows, use get_advanced_search_analytics which supports pagination.
+        search_type: web (default), image, video, news, discover, googleNews
+        response_format: "json" (list of objects, default), "compact" (column header + value
+                   arrays, 30-50% smaller) or "csv"
     """
     try:
-        service = get_gsc_service()
-        
-        # Calculate date range
+        response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
+        dimension_list = _parse_dimensions(dimensions)
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
-        # Parse dimensions
-        dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build request
-        request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": dimension_list,
-            "rowLimit": min(max(1, row_limit), 500),
-            "dataState": DATA_STATE
-        }
-        
-        # Execute request
+        request = _build_search_analytics_request(
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+            dimension_list,
+            search_type=search_type,
+            row_limit=min(max(1, row_limit), 500),
+        )
+    except ValueError as e:
+        return str(e)
+
+    try:
+        service = get_gsc_service()
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
         
         if not response.get("rows"):
             return f"No search analytics data found for {site_url} in the last {days} days."
 
-        rows = []
-        for row in response.get("rows", []):
-            entry = {}
-            for i, dim in enumerate(dimension_list):
-                entry[dim] = row.get("keys", [])[i] if i < len(row.get("keys", [])) else None
-            entry["clicks"] = row.get("clicks", 0)
-            entry["impressions"] = row.get("impressions", 0)
-            entry["ctr"] = round(row.get("ctr", 0), 4)
-            entry["position"] = round(row.get("position", 0), 1)
-            rows.append(entry)
-
-        return json.dumps({
+        rows = _shape_rows(response["rows"], dimension_list)
+        base = {
             "site_url": site_url,
             "date_range": {
                 "start": start_date.strftime("%Y-%m-%d"),
                 "end": end_date.strftime("%Y-%m-%d"),
                 "days": days,
             },
+            "search_type": request["type"],
             "dimensions": dimension_list,
             "row_count": len(rows),
-            "rows": rows,
-        })
+        }
+        freshness = _data_freshness(response)
+        if freshness:
+            base["data_freshness"] = freshness
+        return _dumps_rows_within_budget(base, rows, response_format)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
@@ -665,27 +895,59 @@ def _rich_results_summary(inspection: Dict[str, Any]) -> Optional[Dict[str, Any]
         ],
     }
 
+
+def _format_crawl_time(value: Optional[str], fmt: str = "%Y-%m-%d %H:%M") -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime(fmt)
+    except Exception:
+        return value
+
+
+def _amp_summary(inspection: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Shape the ampResult of a URL inspection; None when the page has no AMP version."""
+    if "ampResult" not in inspection:
+        return None
+    amp = inspection["ampResult"]
+    return {
+        "verdict": amp.get("verdict", "UNKNOWN"),
+        "amp_url": amp.get("ampUrl"),
+        "index_status_verdict": amp.get("ampIndexStatusVerdict"),
+        "indexing_state": amp.get("indexingState"),
+        "page_fetch_state": amp.get("pageFetchState"),
+        "robots_txt_state": amp.get("robotsTxtState"),
+        "last_crawled": _format_crawl_time(amp.get("lastCrawlTime")),
+        "issues": [
+            {"severity": issue.get("severity"), "message": issue.get("issueMessage")}
+            for issue in amp.get("issues", [])
+        ],
+    }
+
+
+def _inspection_request(site_url: str, page_url: str, language_code: Optional[str] = None) -> Dict[str, str]:
+    request = {"inspectionUrl": page_url, "siteUrl": site_url}
+    if language_code:
+        request["languageCode"] = language_code
+    return request
+
+
 @mcp.tool()
-async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
+async def inspect_url_enhanced(site_url: str, page_url: str, language_code: str = None) -> str:
     """
-    Enhanced URL inspection to check indexing status and rich results in Google.
+    Enhanced URL inspection to check indexing status, rich results and AMP status in Google.
     
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
         page_url: The specific URL to inspect
+        language_code: Optional IETF BCP-47 language code (e.g. "zh-CN", "ja", "de") for the
+                  human-readable messages such as coverage state and issue text. Default: en-US.
     """
     try:
         service = get_gsc_service()
-        
-        # Build request
-        request = {
-            "inspectionUrl": page_url,
-            "siteUrl": site_url
-        }
-        
-        # Execute request
+        request = _inspection_request(site_url, page_url, language_code)
         response = service.urlInspection().index().inspect(body=request).execute()
         
         if not response or "inspectionResult" not in response:
@@ -694,32 +956,27 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         inspection = response["inspectionResult"]
         index_status = inspection.get("indexStatusResult", {})
 
-        last_crawled = None
-        if "lastCrawlTime" in index_status:
-            try:
-                crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace("Z", "+00:00"))
-                last_crawled = crawl_time.strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                last_crawled = index_status["lastCrawlTime"]
-
-        rich_results = _rich_results_summary(inspection)
-
-        return json.dumps({
+        result = {
             "page_url": page_url,
             "site_url": site_url,
             "inspection_result_link": inspection.get("inspectionResultLink"),
             "verdict": index_status.get("verdict", "UNKNOWN"),
             "coverage_state": index_status.get("coverageState"),
-            "last_crawled": last_crawled,
+            "last_crawled": _format_crawl_time(index_status.get("lastCrawlTime")),
             "page_fetch_state": index_status.get("pageFetchState"),
             "robots_txt_state": index_status.get("robotsTxtState"),
             "indexing_state": index_status.get("indexingState"),
             "google_canonical": index_status.get("googleCanonical"),
             "user_canonical": index_status.get("userCanonical"),
             "crawled_as": index_status.get("crawledAs"),
+            "sitemaps": index_status.get("sitemap", []),
             "referring_urls": index_status.get("referringUrls", [])[:5],
-            "rich_results": rich_results,
-        })
+            "rich_results": _rich_results_summary(inspection),
+        }
+        amp = _amp_summary(inspection)
+        if amp:
+            result["amp"] = amp
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
@@ -730,7 +987,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
 _BATCH_INSPECTION_CONCURRENCY = 10
 
 
-def _inspect_single_url(site_url: str, page_url: str) -> Dict[str, Any]:
+def _inspect_single_url(site_url: str, page_url: str, language_code: Optional[str] = None) -> Dict[str, Any]:
     """Inspect one URL and shape the result into a row.
 
     Builds its own Search Console service so it is safe to run in a worker thread —
@@ -740,7 +997,7 @@ def _inspect_single_url(site_url: str, page_url: str) -> Dict[str, Any]:
     """
     try:
         service = get_gsc_service()
-        request = {"inspectionUrl": page_url, "siteUrl": site_url}
+        request = _inspection_request(site_url, page_url, language_code)
         response = service.urlInspection().index().inspect(body=request).execute()
 
         if not response or "inspectionResult" not in response:
@@ -749,31 +1006,24 @@ def _inspect_single_url(site_url: str, page_url: str) -> Dict[str, Any]:
         inspection = response["inspectionResult"]
         index_status = inspection.get("indexStatusResult", {})
 
-        verdict = index_status.get("verdict", "UNKNOWN")
-        coverage = index_status.get("coverageState", "Unknown")
-        last_crawl = "Never"
-
-        if "lastCrawlTime" in index_status:
-            try:
-                crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
-                last_crawl = crawl_time.strftime('%Y-%m-%d')
-            except Exception:
-                last_crawl = index_status["lastCrawlTime"]
-
         # Rich results, in the same shape inspect_url_enhanced reports.
-        return {
+        row = {
             "url": page_url,
-            "index_verdict": verdict,
-            "coverage_state": coverage,
-            "last_crawled": last_crawl,
+            "index_verdict": index_status.get("verdict", "UNKNOWN"),
+            "coverage_state": index_status.get("coverageState", "Unknown"),
+            "last_crawled": _format_crawl_time(index_status.get("lastCrawlTime"), "%Y-%m-%d") or "Never",
             "rich_results": _rich_results_summary(inspection),
         }
+        amp = _amp_summary(inspection)
+        if amp:
+            row["amp"] = amp
+        return row
     except Exception as e:
         return {"url": page_url, "error": str(e)}
 
 
 @mcp.tool()
-async def batch_url_inspection(site_url: str, urls: str) -> str:
+async def batch_url_inspection(site_url: str, urls: str, language_code: str = None) -> str:
     """
     Inspect multiple URLs in batch (within API limits).
 
@@ -785,6 +1035,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
         urls: List of URLs to inspect, one per line
+        language_code: Optional IETF BCP-47 language code (e.g. "zh-CN") for human-readable messages
     """
     try:
         # Validate auth once up front. This also refreshes the OAuth token a single
@@ -808,7 +1059,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
 
         async def _run(page_url: str) -> Dict[str, Any]:
             async with semaphore:
-                return await asyncio.to_thread(_inspect_single_url, site_url, page_url)
+                return await asyncio.to_thread(_inspect_single_url, site_url, page_url, language_code)
 
         # asyncio.gather preserves the order of url_list.
         results = await asyncio.gather(*[_run(u) for u in url_list])
@@ -817,7 +1068,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
             "site_url": site_url,
             "count": len(results),
             "results": list(results),
-        })
+        }, ensure_ascii=False)
 
     except Exception as e:
         return f"Error performing batch inspection: {str(e)}"
@@ -864,7 +1115,7 @@ def _check_indexing_single_url(site_url: str, page_url: str) -> Dict[str, Option
             )
 
         robots_state = index_status.get("robotsTxtState", "")
-        if robots_state == "BLOCKED":
+        if robots_state == "DISALLOWED":
             result["robots_blocked"] = page_url
 
         fetch_state = index_status.get("pageFetchState", "")
@@ -947,7 +1198,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
         return f"Error checking indexing issues: {str(e)}"
 
 @mcp.tool()
-async def get_performance_overview(site_url: str, days: int = 28) -> str:
+async def get_performance_overview(site_url: str, days: int = 28, search_type: str = "web") -> str:
     """
     Get a performance overview for a specific property.
     
@@ -956,34 +1207,25 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
         days: Number of days to look back (default: 28)
+        search_type: web (default), image, video, news, discover, googleNews
     """
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    try:
+        total_request = _build_search_analytics_request(
+            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), [],
+            search_type=search_type, row_limit=1,
+        )
+        date_request = _build_search_analytics_request(
+            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), ["date"],
+            search_type=search_type, row_limit=days + 1,
+        )
+    except ValueError as e:
+        return str(e)
+
     try:
         service = get_gsc_service()
-        
-        # Calculate date range
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
-        
-        # Get total metrics
-        total_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": [],  # No dimensions for totals
-            "rowLimit": 1,
-            "dataState": DATA_STATE
-        }
-        
         total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
-        
-        # Get by date for trend
-        date_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["date"],
-            "rowLimit": days,
-            "dataState": DATA_STATE
-        }
-        
         date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
         
         if not total_response.get("rows"):
@@ -1009,16 +1251,21 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
                     "position": round(row.get("position", 0), 1),
                 })
 
-        return json.dumps({
+        result = {
             "site_url": site_url,
             "date_range": {
                 "start": start_date.strftime("%Y-%m-%d"),
                 "end": end_date.strftime("%Y-%m-%d"),
                 "days": days,
             },
+            "search_type": total_request["type"],
             "totals": totals,
             "daily_trend": daily_trend,
-        })
+        }
+        freshness = _data_freshness(date_response)
+        if freshness:
+            result["data_freshness"] = freshness
+        return json.dumps(result)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
@@ -1039,10 +1286,13 @@ async def get_advanced_search_analytics(
     filter_operator: str = "contains", 
     filter_expression: str = None,
     filters: str = None,
-    data_state: str = None
+    data_state: str = None,
+    aggregation_type: str = None,
+    response_format: str = "json",
 ) -> str:
     """
-    Get advanced search analytics data with sorting, filtering, and pagination.
+    Get advanced search analytics data with sorting, filtering, pagination, hourly data and
+    search appearance breakdowns.
     
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
@@ -1050,87 +1300,64 @@ async def get_advanced_search_analytics(
                   domain property as site_url and filter by page to analyze a specific subdomain.
         start_date: Start date in YYYY-MM-DD format (defaults to 28 days ago)
         end_date: End date in YYYY-MM-DD format (defaults to today)
-        dimensions: Dimensions to group by, comma-separated (e.g., "query,page,device")
-        search_type: Type of search results (WEB, IMAGE, VIDEO, NEWS, DISCOVER)
+        dimensions: Dimensions to group by, comma-separated (e.g., "query,page,device").
+                 Options: query, page, country, device, date, searchAppearance, hour.
+                 "hour" returns hourly data for roughly the last 10 days (data_state is set
+                 to hourly_all automatically). "searchAppearance" breaks results down by rich
+                 result / feature type; Google may reject it combined with some dimensions,
+                 so query it alone first and then filter by a specific appearance.
+        search_type: web (default), image, video, news, discover, googleNews
         row_limit: Maximum number of rows to return (max 25000)
         start_row: Starting row for pagination
         sort_by: Metric to sort by (clicks, impressions, ctr, position). Applied
                  client-side to the returned rows, since Google only sorts by clicks.
         sort_direction: Sort direction (ascending or descending). For position,
                  ascending puts the best (lowest) average position first.
-        filter_dimension: Single filter dimension (query, page, country, device). Use 'filters' instead for multiple filters.
-        filter_operator: Single filter operator (contains, equals, notContains, notEquals)
-        filter_expression: Single filter expression value
+        filter_dimension: Single filter dimension (query, page, country, device, searchAppearance).
+                 Use 'filters' instead for multiple filters.
+        filter_operator: Single filter operator (contains, equals, notContains, notEquals,
+                 includingRegex, excludingRegex)
+        filter_expression: Single filter expression value. Regex operators use RE2 syntax.
         filters: JSON array of filter objects for AND logic across multiple dimensions. Overrides
                  filter_dimension/filter_operator/filter_expression when provided. Each object must
                  have 'dimension', 'operator', and 'expression' keys. Valid dimensions: query, page,
-                 country, device. Valid operators: contains, equals, notContains, notEquals.
+                 country, device, searchAppearance. Valid operators: contains, equals, notContains,
+                 notEquals, includingRegex, excludingRegex (RE2 syntax).
                  Example: [{"dimension":"country","operator":"equals","expression":"usa"},
-                           {"dimension":"device","operator":"equals","expression":"MOBILE"}]
-        data_state: Data freshness — "all" (default, matches GSC dashboard) or "final" (confirmed data only, 2-3 day lag)
+                           {"dimension":"query","operator":"includingRegex","expression":"^(how|what) "}]
+        data_state: "all" (default, matches GSC dashboard), "final" (confirmed data only, 2-3 day
+                 lag) or "hourly_all" (only with the hour dimension)
+        aggregation_type: auto (default), byPage, byProperty or byNewsShowcasePanel. Use auto when
+                 grouping or filtering by page. byNewsShowcasePanel is only for news/googleNews.
+        response_format: "json" (list of objects, default), "compact" (column header + value
+                 arrays, 30-50% smaller) or "csv". Large results are trimmed to fit
+                 GSC_MAX_RESPONSE_CHARS; use export_search_analytics for full exports.
     """
+    if not end_date:
+        end_date = datetime.now().date().strftime("%Y-%m-%d")
+    if not start_date:
+        start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
+
+    try:
+        response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
+        dimension_list = _parse_dimensions(dimensions)
+        active_filters = _parse_filters(filters, filter_dimension, filter_operator, filter_expression)
+        # The Search Analytics query API has no orderBy field (it always returns rows
+        # sorted by clicks descending), so sorting is applied client-side below (#54).
+        request = _build_search_analytics_request(
+            start_date, end_date, dimension_list,
+            search_type=search_type,
+            data_state=data_state,
+            aggregation_type=aggregation_type,
+            filter_list=active_filters,
+            row_limit=row_limit,
+            start_row=start_row,
+        )
+    except ValueError as e:
+        return str(e)
+
     try:
         service = get_gsc_service()
-        
-        # Calculate date range if not provided
-        if not end_date:
-            end_date = datetime.now().date().strftime("%Y-%m-%d")
-        if not start_date:
-            start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
-        
-        # Resolve and validate data_state (per-call override or fall back to global setting)
-        resolved_data_state = (data_state or DATA_STATE).lower().strip()
-        if resolved_data_state not in ("all", "final"):
-            return (
-                f"Invalid data_state value '{data_state}'. "
-                "Accepted values are 'all' (matches GSC dashboard) or 'final' (2-3 day lag)."
-            )
-        
-        # Parse dimensions
-        dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build request
-        request = {
-            "startDate": start_date,
-            "endDate": end_date,
-            "dimensions": dimension_list,
-            "rowLimit": min(row_limit, 25000),  # Cap at API maximum
-            "startRow": start_row,
-            "searchType": search_type.upper(),
-            "dataState": resolved_data_state
-        }
-        
-        # Sorting is applied client-side below. The Search Analytics query API has no
-        # orderBy field (it always returns rows sorted by clicks descending), so an
-        # orderBy in the request body was silently ignored (#54).
-        
-        # Build filter groups — multi-filter JSON takes priority over single-filter params
-        active_filters = []
-        if filters:
-            try:
-                filter_list = json.loads(filters)
-            except json.JSONDecodeError:
-                return "Invalid filters JSON. Please provide a valid JSON array of filter objects."
-            if not isinstance(filter_list, list) or len(filter_list) == 0:
-                return "Invalid filters value. Expected a non-empty JSON array of filter objects."
-            for f in filter_list:
-                if not all(k in f for k in ("dimension", "operator", "expression")):
-                    return (
-                        "Each filter object must have 'dimension', 'operator', and 'expression' keys. "
-                        f"Invalid filter: {f}"
-                    )
-            request["dimensionFilterGroups"] = [{"filters": filter_list}]
-            active_filters = filter_list
-        elif filter_dimension and filter_expression:
-            single_filter = {
-                "dimension": filter_dimension,
-                "operator": filter_operator,
-                "expression": filter_expression
-            }
-            request["dimensionFilterGroups"] = [{"filters": [single_filter]}]
-            active_filters = [single_filter]
-        
-        # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
         
         if not response.get("rows"):
@@ -1149,16 +1376,7 @@ async def get_advanced_search_analytics(
                 no_data_msg += "- No filter applied\n"
             return no_data_msg
         
-        rows = []
-        for row in response.get("rows", []):
-            entry = {}
-            for i, dim in enumerate(dimension_list):
-                entry[dim] = row.get("keys", [])[i] if i < len(row.get("keys", [])) else None
-            entry["clicks"] = row.get("clicks", 0)
-            entry["impressions"] = row.get("impressions", 0)
-            entry["ctr"] = round(row.get("ctr", 0), 4)
-            entry["position"] = round(row.get("position", 0), 1)
-            rows.append(entry)
+        rows = _shape_rows(response["rows"], dimension_list)
 
         # Sort the returned rows client-side. Google only sorts by clicks descending
         # server-side, so without this the sort_by/sort_direction args were silently
@@ -1168,21 +1386,28 @@ async def get_advanced_search_analytics(
             reverse = sort_direction.lower() != "ascending"
             rows.sort(key=lambda r: r.get(sort_by, 0), reverse=reverse)
 
-        has_more = len(response.get("rows", [])) == row_limit
-        return json.dumps({
+        page_size = request["rowLimit"]
+        has_more = len(response["rows"]) == page_size
+        base = {
             "site_url": site_url,
             "date_range": {"start": start_date, "end": end_date},
-            "search_type": search_type,
+            "search_type": request["type"],
+            "data_state": request["dataState"],
             "dimensions": dimension_list,
             "filters_applied": active_filters,
             "pagination": {
                 "start_row": start_row,
                 "row_count": len(rows),
                 "has_more": has_more,
-                "next_start_row": start_row + row_limit if has_more else None,
+                "next_start_row": start_row + page_size if has_more else None,
             },
-            "rows": rows,
-        })
+        }
+        if response.get("responseAggregationType"):
+            base["aggregation_type"] = response["responseAggregationType"]
+        freshness = _data_freshness(response)
+        if freshness:
+            base["data_freshness"] = freshness
+        return _dumps_rows_within_budget(base, rows, response_format)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
@@ -1196,7 +1421,9 @@ async def compare_search_periods(
     period2_start: str,
     period2_end: str,
     dimensions: str = "query",
-    limit: int = 10
+    limit: int = 10,
+    search_type: str = "web",
+    response_format: str = "json",
 ) -> str:
     """
     Compare search analytics data between two time periods.
@@ -1217,33 +1444,28 @@ async def compare_search_periods(
         period1_end: End date for period 1 / the analyzed period (YYYY-MM-DD)
         period2_start: Start date for period 2 / the baseline period (YYYY-MM-DD)
         period2_end: End date for period 2 / the baseline period (YYYY-MM-DD)
-        dimensions: Dimensions to group by (default: query)
+        dimensions: Dimensions to group by (default: query). Options: query, page, country,
+                    device, date, searchAppearance
         limit: Number of top results to compare (default: 10)
+        search_type: web (default), image, video, news, discover, googleNews
+        response_format: "json" (default), "compact" (column header + value arrays) or "csv"
     """
     try:
+        response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
+        dimension_list = _parse_dimensions(dimensions)
+        # Fetch more rows than `limit` so items can be matched between periods.
+        period1_request = _build_search_analytics_request(
+            period1_start, period1_end, dimension_list, search_type=search_type, row_limit=1000,
+        )
+        period2_request = _build_search_analytics_request(
+            period2_start, period2_end, dimension_list, search_type=search_type, row_limit=1000,
+        )
+    except ValueError as e:
+        return str(e)
+
+    try:
         service = get_gsc_service()
-        
-        # Parse dimensions
-        dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build requests for both periods
-        period1_request = {
-            "startDate": period1_start,
-            "endDate": period1_end,
-            "dimensions": dimension_list,
-            "rowLimit": 1000,  # Get more to ensure we can match items between periods
-            "dataState": DATA_STATE
-        }
-        
-        period2_request = {
-            "startDate": period2_start,
-            "endDate": period2_end,
-            "dimensions": dimension_list,
-            "rowLimit": 1000,
-            "dataState": DATA_STATE
-        }
-        
-        # Execute requests
+
         period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
         period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
         
@@ -1320,15 +1542,20 @@ async def compare_search_periods(
                 "position_diff": round(item["pos_diff"], 1),
             })
 
-        return json.dumps({
+        base = {
             "site_url": site_url,
             "period1": {"start": period1_start, "end": period1_end},
             "period2": {"start": period2_start, "end": period2_end},
+            "search_type": period1_request["type"],
             "dimensions": dimension_list,
             "total_items": len(comparison_data),
             "showing": len(serialisable),
-            "comparison": serialisable,
-        })
+        }
+        payload = json.loads(_dumps_rows_within_budget(base, serialisable, response_format))
+        # Keep the established "comparison" key for the default JSON shape.
+        if "rows" in payload and response_format == "json":
+            payload["comparison"] = payload.pop("rows")
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
@@ -1339,7 +1566,9 @@ async def get_search_by_page_query(
     site_url: str,
     page_url: str,
     days: int = 28,
-    row_limit: int = 20
+    row_limit: int = 20,
+    search_type: str = "web",
+    response_format: str = "json",
 ) -> str:
     """
     Get search analytics data for a specific page, broken down by query.
@@ -1353,33 +1582,27 @@ async def get_search_by_page_query(
         row_limit: Number of rows to return (default: 20, max: 500). Use 5-20 for quick overviews,
                    50-200 for deeper analysis, up to 500 for comprehensive reports. For bulk exports
                    beyond 500 rows, use get_advanced_search_analytics which supports pagination.
+        search_type: web (default), image, video, news, discover, googleNews
+        response_format: "json" (default), "compact" (column header + value arrays) or "csv"
     """
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    try:
+        response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
+        # The API always returns rows sorted by clicks descending, which is what we want here.
+        request = _build_search_analytics_request(
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+            ["query"],
+            search_type=search_type,
+            filter_list=[{"dimension": "page", "operator": "equals", "expression": page_url}],
+            row_limit=min(max(1, row_limit), 500),
+        )
+    except ValueError as e:
+        return str(e)
+
     try:
         service = get_gsc_service()
-        
-        # Calculate date range
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
-        
-        # Build request with page filter
-        request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["query"],
-            "dimensionFilterGroups": [{
-                "filters": [{
-                    "dimension": "page",
-                    "operator": "equals",
-                    "expression": page_url
-                }]
-            }],
-            "rowLimit": min(max(1, row_limit), 500),
-            # Note: the Search Analytics query API has no orderBy field — it always
-            # returns rows sorted by clicks descending (which is what we want here).
-            "dataState": DATA_STATE
-        }
-        
-        # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
         
         if not response.get("rows"):
@@ -1398,7 +1621,7 @@ async def get_search_by_page_query(
         total_clicks = sum(r["clicks"] for r in rows)
         total_impressions = sum(r["impressions"] for r in rows)
 
-        return json.dumps({
+        base = {
             "site_url": site_url,
             "page_url": page_url,
             "date_range": {
@@ -1406,16 +1629,310 @@ async def get_search_by_page_query(
                 "end": end_date.strftime("%Y-%m-%d"),
                 "days": days,
             },
+            "search_type": request["type"],
             "totals": {
                 "clicks": total_clicks,
                 "impressions": total_impressions,
                 "avg_ctr": round(total_clicks / total_impressions, 4) if total_impressions > 0 else 0,
             },
             "row_count": len(rows),
-            "rows": rows,
-        })
+        }
+        return _dumps_rows_within_budget(base, rows, response_format)
     except Exception as e:
         return f"Error retrieving page query data: {str(e)}"
+
+
+def _run_export(
+    service: Any,
+    site_url: str,
+    base_request: Dict[str, Any],
+    dimension_list: List[str],
+    max_rows: int,
+    file_format: str,
+    path: str,
+    preview_rows: int,
+) -> Dict[str, Any]:
+    """Page through searchanalytics.query (25k rows per call) and stream every row to ``path``."""
+    fetched = 0
+    pages = 0
+    complete = False
+    preview: List[Dict[str, Any]] = []
+    clicks = impressions = weighted_position = 0.0
+    freshness = None
+    columns = dimension_list + ["clicks", "impressions", "ctr", "position"]
+
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh) if file_format == "csv" else None
+        if writer:
+            writer.writerow(columns)
+        while fetched < max_rows:
+            body = dict(base_request, rowLimit=min(_API_MAX_ROWS, max_rows - fetched), startRow=fetched)
+            response = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+            pages += 1
+            api_rows = response.get("rows", [])
+            freshness = freshness or _data_freshness(response)
+            rows = _shape_rows(api_rows, dimension_list)
+            for r in rows:
+                if writer:
+                    writer.writerow([r.get(c) for c in columns])
+                else:
+                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+                clicks += r["clicks"]
+                impressions += r["impressions"]
+                weighted_position += r["position"] * r["impressions"]
+            if len(preview) < preview_rows:
+                preview.extend(rows[: preview_rows - len(preview)])
+            fetched += len(rows)
+            if len(api_rows) < body["rowLimit"]:
+                complete = True
+                break
+
+    return {
+        "row_count": fetched,
+        "api_calls": pages,
+        "complete": complete,
+        "totals": {
+            "clicks": int(clicks),
+            "impressions": int(impressions),
+            "ctr": round(clicks / impressions, 4) if impressions else 0,
+            "position": round(weighted_position / impressions, 1) if impressions else 0,
+        },
+        "preview": preview,
+        "data_freshness": freshness,
+    }
+
+
+@mcp.tool()
+async def export_search_analytics(
+    site_url: str,
+    start_date: str = None,
+    end_date: str = None,
+    dimensions: str = "query,page",
+    search_type: str = "web",
+    filters: str = None,
+    data_state: str = None,
+    aggregation_type: str = None,
+    max_rows: int = 100000,
+    file_format: str = "csv",
+    preview_rows: int = 10,
+) -> str:
+    """
+    Export a large search analytics result set to a local file instead of the chat context.
+
+    Pages through the API automatically (25,000 rows per call) and writes every row to a
+    CSV or JSONL file on the machine running this server. Only a short summary — file path,
+    row count, totals and the top `preview_rows` rows by clicks — is returned, so tens of
+    thousands of rows cost a few hundred tokens. Use this for bulk analysis, spreadsheets,
+    or when other tools report a "truncation" block.
+
+    Args:
+        site_url: Exact GSC property URL from list_properties
+        start_date: Start date YYYY-MM-DD (defaults to 28 days ago)
+        end_date: End date YYYY-MM-DD (defaults to today)
+        dimensions: Comma-separated dimensions (default "query,page"). Options: query, page,
+                    country, device, date, searchAppearance, hour
+        search_type: web (default), image, video, news, discover, googleNews
+        filters: Optional JSON array of filter objects, same format as get_advanced_search_analytics
+        data_state: "all", "final" or "hourly_all" (defaults to GSC_DATA_STATE)
+        aggregation_type: auto, byPage, byProperty or byNewsShowcasePanel
+        max_rows: Stop after this many rows (default 100000)
+        file_format: "csv" (default) or "jsonl"
+        preview_rows: Number of top rows to include in the response (default 10, 0 for none)
+    """
+    if not end_date:
+        end_date = datetime.now().date().strftime("%Y-%m-%d")
+    if not start_date:
+        start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
+
+    try:
+        file_format = _normalize_choice(file_format or "csv", ("csv", "jsonl"), "file_format")
+        dimension_list = _parse_dimensions(dimensions)
+        filter_list = _parse_filters(filters)
+        base_request = _build_search_analytics_request(
+            start_date, end_date, dimension_list,
+            search_type=search_type,
+            data_state=data_state,
+            aggregation_type=aggregation_type,
+            filter_list=filter_list,
+        )
+    except ValueError as e:
+        return str(e)
+    if max_rows < 1:
+        return "max_rows must be at least 1."
+
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", site_url).strip("_")[:60]
+    filename = f"gsc_{slug}_{start_date}_{end_date}_{datetime.now().strftime('%Y%m%d%H%M%S')}.{file_format}"
+    path = os.path.join(EXPORT_DIR, filename)
+
+    try:
+        service = get_gsc_service()
+        summary = await asyncio.to_thread(
+            _run_export, service, site_url, base_request, dimension_list,
+            max_rows, file_format, path, max(0, preview_rows),
+        )
+    except Exception as e:
+        if os.path.exists(path):
+            os.remove(path)
+        if "404" in str(e):
+            return _site_not_found_error(site_url)
+        return f"Error exporting search analytics: {str(e)}"
+
+    if summary["row_count"] == 0:
+        os.remove(path)
+        return f"No search analytics data found for {site_url} between {start_date} and {end_date}."
+
+    result = {
+        "site_url": site_url,
+        "file_path": path,
+        "file_format": file_format,
+        "date_range": {"start": start_date, "end": end_date},
+        "search_type": base_request["type"],
+        "data_state": base_request["dataState"],
+        "dimensions": dimension_list,
+        "filters_applied": filter_list,
+        "row_count": summary["row_count"],
+        "api_calls": summary["api_calls"],
+        "complete": summary["complete"],
+        "totals_of_exported_rows": summary["totals"],
+        "preview": summary["preview"],
+    }
+    if not summary["complete"]:
+        result["note"] = f"Stopped at max_rows={max_rows}; more rows are available."
+    if "query" in dimension_list:
+        result["totals_note"] = (
+            "Totals are summed from exported rows; Google omits anonymized queries, so they "
+            "are lower than get_performance_overview totals."
+        )
+    if summary["data_freshness"]:
+        result["data_freshness"] = summary["data_freshness"]
+    return json.dumps(result, ensure_ascii=False)
+
+
+_PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+
+# CrUX field metric key -> (output name, divisor). CLS is reported multiplied by 100.
+_CWV_FIELD_METRICS = {
+    "LARGEST_CONTENTFUL_PAINT_MS": ("lcp_ms", 1),
+    "INTERACTION_TO_NEXT_PAINT": ("inp_ms", 1),
+    "CUMULATIVE_LAYOUT_SHIFT_SCORE": ("cls", 100),
+    "FIRST_CONTENTFUL_PAINT_MS": ("fcp_ms", 1),
+    "EXPERIMENTAL_TIME_TO_FIRST_BYTE": ("ttfb_ms", 1),
+}
+
+_LAB_AUDITS = {
+    "largest-contentful-paint": "lcp_ms",
+    "cumulative-layout-shift": "cls",
+    "total-blocking-time": "tbt_ms",
+    "first-contentful-paint": "fcp_ms",
+    "speed-index": "speed_index_ms",
+}
+
+
+def _fetch_pagespeed(page_url: str, strategy: str) -> Dict[str, Any]:
+    params = {"url": page_url, "strategy": strategy, "category": "PERFORMANCE"}
+    if PAGESPEED_API_KEY:
+        params["key"] = PAGESPEED_API_KEY
+    url = f"{_PAGESPEED_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _field_data(experience: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not experience or not experience.get("metrics"):
+        return None
+    metrics = {}
+    for api_key, (name, divisor) in _CWV_FIELD_METRICS.items():
+        metric = experience["metrics"].get(api_key)
+        if metric and metric.get("percentile") is not None:
+            p75 = metric["percentile"]
+            metrics[name] = {
+                "p75": round(p75 / divisor, 2) if divisor != 1 else p75,
+                "category": metric.get("category"),
+            }
+    field = {"overall_category": experience.get("overall_category"), "metrics": metrics}
+    if experience.get("origin_fallback"):
+        field["origin_fallback"] = True
+    return field
+
+
+def _lab_opportunities(audits: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    found = []
+    for audit_id, audit in audits.items():
+        score = audit.get("score")
+        if score is None or score >= 0.9:
+            continue
+        savings_ms = (audit.get("details") or {}).get("overallSavingsMs") or 0
+        if not savings_ms:
+            metric_savings = audit.get("metricSavings") or {}
+            savings_ms = max((v for k, v in metric_savings.items() if k != "CLS" and isinstance(v, (int, float))), default=0)
+        if savings_ms > 0:
+            found.append({"id": audit_id, "title": audit.get("title"), "estimated_savings_ms": round(savings_ms)})
+    found.sort(key=lambda o: o["estimated_savings_ms"], reverse=True)
+    return found[:limit]
+
+
+@mcp.tool()
+async def get_core_web_vitals(page_url: str, strategy: str = "mobile", max_opportunities: int = 5) -> str:
+    """
+    Get Core Web Vitals (LCP, INP, CLS) for a URL via the PageSpeed Insights API.
+
+    The Search Console API does not expose the Core Web Vitals report, so this returns the
+    same underlying Chrome UX Report (CrUX) field data — 28-day p75 values for the page and
+    its whole origin, with GOOD / NEEDS_IMPROVEMENT / POOR ratings — plus a Lighthouse lab
+    run and its biggest performance opportunities. Takes 10-60 seconds per URL.
+
+    Args:
+        page_url: Full public URL to test (e.g. "https://example.com/page/")
+        strategy: "mobile" (default, what Google uses for ranking) or "desktop"
+        max_opportunities: Number of top lab improvement opportunities to include (default 5, 0 for none)
+    """
+    try:
+        strategy = _normalize_choice(strategy or "mobile", ("mobile", "desktop"), "strategy")
+    except ValueError as e:
+        return str(e)
+
+    try:
+        data = await asyncio.to_thread(_fetch_pagespeed, page_url, strategy.upper())
+    except urllib.error.HTTPError as e:
+        try:
+            message = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", str(e))
+        except Exception:
+            message = str(e)
+        if e.code == 429:
+            return (
+                "Error: PageSpeed Insights quota exceeded. Set GSC_PAGESPEED_API_KEY to a Google "
+                f"Cloud API key with the PageSpeed Insights API enabled. Details: {message}"
+            )
+        return f"Error running PageSpeed Insights (HTTP {e.code}): {message}"
+    except Exception as e:
+        return f"Error running PageSpeed Insights: {str(e)}"
+
+    lighthouse = data.get("lighthouseResult") or {}
+    audits = lighthouse.get("audits") or {}
+    performance = (lighthouse.get("categories") or {}).get("performance") or {}
+
+    lab_metrics = {}
+    for audit_id, name in _LAB_AUDITS.items():
+        value = (audits.get(audit_id) or {}).get("numericValue")
+        if value is not None:
+            lab_metrics[name] = round(value, 3) if name == "cls" else round(value)
+
+    result = {
+        "page_url": page_url,
+        "strategy": strategy,
+        "field_data_page": _field_data(data.get("loadingExperience")),
+        "field_data_origin": _field_data(data.get("originLoadingExperience")),
+        "lab_data": {
+            "performance_score": round(performance["score"] * 100) if performance.get("score") is not None else None,
+            "metrics": lab_metrics,
+        },
+    }
+    if max_opportunities > 0:
+        result["lab_data"]["top_opportunities"] = _lab_opportunities(audits, max_opportunities)
+    if not result["field_data_page"] and not result["field_data_origin"]:
+        result["field_data_note"] = "Not enough real-user Chrome traffic for CrUX field data; only lab data is available."
+    return json.dumps(result, ensure_ascii=False)
 
 @mcp.tool()
 async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
