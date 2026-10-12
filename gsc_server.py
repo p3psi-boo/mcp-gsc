@@ -520,7 +520,7 @@ Page Experience:
   - get_core_web_vitals: Core Web Vitals (LCP, INP, CLS) field + lab data via PageSpeed Insights
 
 Keeping responses small:
-  - Row-based tools accept response_format="compact" or "csv" (~half the tokens of "json")
+  - Row-based tools accept response_format="compact" or "csv" (30-50% smaller than "json")
   - Responses over GSC_MAX_RESPONSE_CHARS are trimmed and include a "truncation" hint
 
 Sitemaps:
@@ -713,7 +713,7 @@ async def get_search_analytics(
                    beyond 500 rows, use get_advanced_search_analytics which supports pagination.
         search_type: web (default), image, video, news, discover, googleNews
         response_format: "json" (list of objects, default), "compact" (column header + value
-                   arrays, ~half the tokens) or "csv"
+                   arrays, 30-50% smaller) or "csv"
     """
     try:
         response_format = _normalize_choice(response_format or "json", _RESPONSE_FORMATS, "response_format")
@@ -1330,7 +1330,7 @@ async def get_advanced_search_analytics(
         aggregation_type: auto (default), byPage, byProperty or byNewsShowcasePanel. Use auto when
                  grouping or filtering by page. byNewsShowcasePanel is only for news/googleNews.
         response_format: "json" (list of objects, default), "compact" (column header + value
-                 arrays, ~half the tokens) or "csv". Large results are trimmed to fit
+                 arrays, 30-50% smaller) or "csv". Large results are trimmed to fit
                  GSC_MAX_RESPONSE_CHARS; use export_search_analytics for full exports.
     """
     if not end_date:
